@@ -51,8 +51,44 @@ export class ModelDB {
     try {
       this.modelVersion = await this.db.get('currentModelVersion');
     } catch {
-      await this.writeNewVars(model.getVars() as tf.Tensor[]);
+      await this.putModel(model.getVars() as tf.Tensor[]);
     }
+  }
+
+  private async getValues<T>(min: string, max: string): Promise<T[]> {
+    return new Promise((resolve, reject) => {
+             const values: T[] = [];
+             this.db.createValueStream({gt: min, lt: max})
+                 .on('data', (val: T) => values.push(val))
+                 .on('error', (error) => reject(error))
+                 .on('end', () => resolve(values));
+           }) as Promise<T[]>;
+  }
+
+  async getModels(): Promise<ModelJson[]> {
+    return this.getValues('models/', 'models/z');
+  }
+
+  async getData(): Promise<DataJson[]> {
+    return this.getValues('data/', 'data/z');
+  }
+
+  async getUpdates(modelVersion: string): Promise<UpdateJson[]> {
+    const minKey = 'updates/' + modelVersion
+    const maxKey = 'updates/' + (parseInt(minKey, 10) + 1).toString();
+    return this.getValues(minKey, maxKey);
+  }
+
+  async putModel(newVars: tf.Tensor[]) {
+    const newModelVersion = currentTimestamp();
+    const newVarsJson = await Promise.all(newVars.map(tensorToJson));
+    await this.db.put('models/' + newModelVersion, {
+      'version': newModelVersion,
+      'vars': newVarsJson,
+      'parent': this.modelVersion
+    });
+    await this.db.put('currentModelVersion', newModelVersion);
+    this.modelVersion = newModelVersion;
   }
 
   async putData(data: DataJson): Promise<void> {
@@ -65,30 +101,8 @@ export class ModelDB {
     return this.db.put('data/' + data.timestamp + '_' + uuid(), data);
   }
 
-  async getData(): Promise<DataJson[]> {
-    return new Promise((resolve, reject) => {
-             const data: DataJson[] = [];
-             this.db.createValueStream({gt: 'data/', lt: 'data/z'})
-                 .on('data', (datum: DataJson) => data.push(datum))
-                 .on('error', (error) => reject(error))
-                 .on('end', () => resolve(data));
-           }) as Promise<DataJson[]>;
-  }
-
   async putUpdate(update: UpdateJson): Promise<void> {
     return this.db.put(update.modelVersion + '/' + uuid(), update);
-  }
-
-  async getUpdates(): Promise<UpdateJson[]> {
-    const min = this.modelVersion;
-    const max = (parseInt(min, 10) + 1).toString();
-    return new Promise((resolve, reject) => {
-             const updates: UpdateJson[] = [];
-             this.db.createValueStream({gt: min, lt: max})
-                 .on('data', (data: UpdateJson) => updates.push(data))
-                 .on('error', (error) => reject(error))
-                 .on('end', () => resolve(updates));
-           }) as Promise<UpdateJson[]>;
   }
 
   async countUpdates(): Promise<number> {
@@ -104,12 +118,12 @@ export class ModelDB {
   }
 
   async getModelVars(modelVersion: string): Promise<tf.Tensor[]> {
-    const model: ModelJson = await this.db.get(modelVersion);
+    const model: ModelJson = await this.db.get('models/' + modelVersion);
     return model.vars.map(jsonToTensor);
   }
 
   async currentVars(): Promise<tf.Tensor[]> {
-    return this.getModelVars(this.modelVersion);
+    return this.getModel(this.modelVersion);
   }
 
   async possiblyUpdate(): Promise<boolean> {
@@ -122,9 +136,10 @@ export class ModelDB {
   }
 
   async update() {
-    const currentVars = await this.currentVars();
+    const version = this.modelVersion
+    const currentVars = await this.getModelVars(version);
     const updatedVars = currentVars.map(v => tf.zerosLike(v));
-    const updatesJSON = await this.getUpdates();
+    const updatesJSON = await this.getUpdates(version);
 
     // Compute total number of examples for normalization
     let totalNumExamples = 0;
@@ -151,16 +166,8 @@ export class ModelDB {
     n.dispose();
 
     // Save results and update key
-    await this.writeNewVars(updatedVars);
+    await this.putModel(updatedVars);
 
     tf.dispose([updatedVars, currentVars]);
-  }
-
-  async writeNewVars(newVars: tf.Tensor[]) {
-    const newModelVersion = currentTimestamp();
-    const newVarsJson = await Promise.all(newVars.map(tensorToJson));
-    await this.db.put(newModelVersion, {'vars': newVarsJson});
-    await this.db.put('currentModelVersion', newModelVersion);
-    this.modelVersion = newModelVersion;
   }
 }
